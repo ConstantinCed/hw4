@@ -17,6 +17,10 @@ import torch.nn as nn
 from torch import Tensor
 
 
+def _expand_like(values: Tensor, target: Tensor) -> Tensor:
+    return values.view(values.shape[0], *([1] * (target.ndim - 1)))
+
+
 class VPSDE:
     """Variance-Preserving SDE forward process and samplers.
 
@@ -51,8 +55,7 @@ class VPSDE:
 
         Reference: Eq. (32) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        return self.beta_min + (self.beta_max - self.beta_min) * t
 
     def c(self, t: Tensor) -> Tensor:
         """c(t) = exp(-½ ∫_0^t β(s) ds) — the signal decay factor.
@@ -68,8 +71,8 @@ class VPSDE:
 
         Reference: Eq. (33) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        integral = self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t**2
+        return torch.exp(-0.5 * integral)
 
     def sigma(self, t: Tensor) -> Tensor:
         """σ(t) = √(1 - c(t)²) — the noise standard deviation.
@@ -80,8 +83,7 @@ class VPSDE:
         Returns:
             σ(t), same shape as t.
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        return torch.sqrt(torch.clamp(1 - self.c(t) ** 2, min=0.0))
 
     def drift(self, x: Tensor, t: Tensor) -> Tensor:
         """Drift coefficient  f(x, t) = -½ β(t) x.
@@ -93,8 +95,7 @@ class VPSDE:
         Returns:
             Drift f(x, t), same shape as x.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        return -0.5 * _expand_like(self.beta(t), x) * x
 
     def diffusion(self, t: Tensor) -> Tensor:
         """Diffusion coefficient  g(t) = √β(t).
@@ -105,8 +106,7 @@ class VPSDE:
         Returns:
             g(t), same shape as t.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        return torch.sqrt(self.beta(t))
 
     def marginal(self, x0: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
         """Sample from the forward marginal  q(x_t | x_0).
@@ -121,8 +121,11 @@ class VPSDE:
         Returns:
             (x_t, eps): noised sample and the noise used, both shape (B, *).
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        eps = torch.randn_like(x0)
+        c_t = _expand_like(self.c(t), x0)
+        sigma_t = _expand_like(self.sigma(t), x0)
+        x_t = c_t * x0 + sigma_t * eps
+        return x_t, eps
 
     # ------------------------------------------------------------------
     # 5.B  Samplers
@@ -153,10 +156,24 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.i) — implement the EM sampler
-        # Hint: time runs from t=1 down to t≈0 in steps of Δt = 1/num_steps.
-        #       At t=1, initialise x ~ N(0, σ(1)² I).
-        raise NotImplementedError
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        score_model.eval()
+        device = torch.device(device)
+        dtype = next(score_model.parameters()).dtype
+        sigma_1 = self.sigma(torch.ones(1, device=device, dtype=dtype)).item()
+        x = sigma_1 * torch.randn(shape, device=device, dtype=dtype)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t_value = 1.0 - i * dt
+            t = torch.full((shape[0],), t_value, device=device, dtype=dtype)
+            beta_t = _expand_like(self.beta(t), x)
+            score = score_model(x, t)
+            reverse_drift = self.drift(x, t) - beta_t * score
+            x = x - reverse_drift * dt
+            if i < num_steps - 1:
+                x = x + torch.sqrt(beta_t * dt) * torch.randn_like(x)
+        return x.clamp(-1, 1)
 
     @torch.no_grad()
     def predictor_corrector(
@@ -185,8 +202,61 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.ii)
-        raise NotImplementedError
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        score_model.eval()
+        device = torch.device(device)
+        dtype = next(score_model.parameters()).dtype
+        sigma_1 = self.sigma(torch.ones(1, device=device, dtype=dtype)).item()
+        x = sigma_1 * torch.randn(shape, device=device, dtype=dtype)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t_value = 1.0 - i * dt
+            t = torch.full((shape[0],), t_value, device=device, dtype=dtype)
+            for _ in range(n_corrector):
+                score = score_model(x, t)
+                noise = torch.randn_like(x)
+                score_norm = score.reshape(shape[0], -1).norm(dim=1).mean().clamp_min(1e-12)
+                noise_norm = noise.reshape(shape[0], -1).norm(dim=1).mean()
+                step_size = 2 * (snr * noise_norm / score_norm) ** 2
+                x = x + step_size * score + torch.sqrt(2 * step_size) * noise
+            beta_t = _expand_like(self.beta(t), x)
+            score = score_model(x, t)
+            reverse_drift = self.drift(x, t) - beta_t * score
+            x = x - reverse_drift * dt
+            if i < num_steps - 1:
+                x = x + torch.sqrt(beta_t * dt) * torch.randn_like(x)
+        return x.clamp(-1, 1)
+
+    @torch.no_grad()
+    def ddim_sample(
+        self,
+        score_model: nn.Module,
+        shape: tuple[int, ...],
+        num_steps: int | None = None,
+        device: str | torch.device = "cpu",
+    ) -> Tensor:
+        num_steps = num_steps or self.T
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        score_model.eval()
+        device = torch.device(device)
+        dtype = next(score_model.parameters()).dtype
+        sigma_1 = self.sigma(torch.ones(1, device=device, dtype=dtype)).item()
+        x = sigma_1 * torch.randn(shape, device=device, dtype=dtype)
+        times = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=dtype)
+        for i in range(num_steps):
+            t = torch.full((shape[0],), times[i].item(), device=device, dtype=dtype)
+            s = torch.full((shape[0],), times[i + 1].item(), device=device, dtype=dtype)
+            score = score_model(x, t)
+            c_t = _expand_like(self.c(t), x).clamp_min(1e-5)
+            sigma_t = _expand_like(self.sigma(t), x)
+            eps_hat = -sigma_t * score
+            x0_hat = (x - sigma_t * eps_hat) / c_t
+            c_s = _expand_like(self.c(s), x)
+            sigma_s = _expand_like(self.sigma(s), x)
+            x = c_s * x0_hat + sigma_s * eps_hat
+        return x.clamp(-1, 1)
 
     # ------------------------------------------------------------------
     # 5.D  Inverse problems (EC)
@@ -223,5 +293,28 @@ class VPSDE:
             Reconstructed images, shape (B, C, H, W).
         """
         num_steps = num_steps or self.T
-        # TODO (EC 5.D)
-        raise NotImplementedError
+        score_model.eval()
+        device = torch.device(device)
+        corrupted = corrupted.to(device)
+        mask = mask.to(device)
+        shape = corrupted.shape
+        dtype = corrupted.dtype
+        sigma_1 = self.sigma(torch.ones(1, device=device, dtype=dtype)).item()
+        x = sigma_1 * torch.randn(shape, device=device, dtype=dtype)
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t_value = 1.0 - i * dt
+            t = torch.full((shape[0],), t_value, device=device, dtype=dtype)
+            beta_t = _expand_like(self.beta(t), x)
+            score = score_model(x, t)
+            reverse_drift = self.drift(x, t) - beta_t * score
+            x = x - reverse_drift * dt
+            if i < num_steps - 1:
+                x = x + torch.sqrt(beta_t * dt) * torch.randn_like(x)
+            t_next_value = max(0.0, t_value - dt)
+            t_next = torch.full((shape[0],), t_next_value, device=device, dtype=dtype)
+            known_noise = torch.randn_like(corrupted)
+            known = _expand_like(self.c(t_next), corrupted) * corrupted
+            known = known + _expand_like(self.sigma(t_next), corrupted) * known_noise
+            x = mask * known + (1 - mask) * x
+        return x.clamp(-1, 1)

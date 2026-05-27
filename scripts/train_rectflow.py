@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets, transforms
+import yaml
 
 from diffusion.unet import UNet
 from diffusion.rectflow import RectifiedFlow
@@ -28,6 +29,7 @@ from diffusion.rectflow import RectifiedFlow
 
 def get_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--config",         type=str,   default=None)
     p.add_argument("--epochs",         type=int,   default=50)
     p.add_argument("--lr",             type=float, default=1e-4)
     p.add_argument("--batch_size",     type=int,   default=128)
@@ -68,6 +70,18 @@ def train_one_epoch(model, flow, dataloader, optimizer, device):
 
 def main():
     args = get_args()
+    if args.config is not None:
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        args.epochs = cfg.get("training", {}).get("epochs", args.epochs)
+        args.lr = cfg.get("training", {}).get("lr", args.lr)
+        args.batch_size = cfg.get("training", {}).get("batch_size", args.batch_size)
+        args.save_dir = cfg.get("paths", {}).get("save_dir", args.save_dir)
+        args.n_reflow_pairs = cfg.get("reflow", {}).get("n_pairs", args.n_reflow_pairs)
+        args.reflow_steps = cfg.get("reflow", {}).get("euler_steps", args.reflow_steps)
+        if args.reflow:
+            args.epochs = cfg.get("reflow", {}).get("retrain_epochs", args.epochs)
+            args.save_dir = cfg.get("paths", {}).get("reflow_save_dir", args.save_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device(args.device)
 

@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+import yaml
 
 from diffusion.unet import UNet
 from diffusion.vp import VPSDE
@@ -67,14 +68,26 @@ def score_loss(sde: VPSDE, model: torch.nn.Module, x0: torch.Tensor, device) -> 
     Returns:
         Scalar loss.
     """
-    # TODO (5.A.iii / 5.B setup) — implement the DSM loss.
-    # Hint: sample t ~ Uniform(0,1), call sde.marginal(), call model(x_t, t),
-    #       and compute the weighted MSE as in Song21 Eq. (7).
-    raise NotImplementedError
+    t = torch.rand(x0.shape[0], device=device, dtype=x0.dtype).clamp_min(1e-5)
+    x_t, eps = sde.marginal(x0, t)
+    score = model(x_t, t)
+    sigma_t = sde.sigma(t).view(t.shape[0], *([1] * (x0.ndim - 1))).clamp_min(1e-5)
+    return F.mse_loss(sigma_t * score, -eps)
 
 
 def main():
     args = get_args()
+    if args.config is not None:
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        args.beta_min = cfg.get("sde", {}).get("beta_min", args.beta_min)
+        args.beta_max = cfg.get("sde", {}).get("beta_max", args.beta_max)
+        args.T = cfg.get("sde", {}).get("T", args.T)
+        args.epochs = cfg.get("training", {}).get("epochs", args.epochs)
+        args.lr = cfg.get("training", {}).get("lr", args.lr)
+        args.batch_size = cfg.get("training", {}).get("batch_size", args.batch_size)
+        args.patience = cfg.get("training", {}).get("patience", args.patience)
+        args.save_dir = cfg.get("paths", {}).get("save_dir", args.save_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device(args.device)
 

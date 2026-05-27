@@ -41,6 +41,11 @@ from diffusion.rectflow import RectifiedFlow
 
 STEP_COUNTS = [1, 5, 10, 50, 100, 200, 1000]
 METHODS = ["rectflow", "ddim", "em"]
+METHOD_LABELS = {
+    "rectflow": "Flow Matching",
+    "ddim": "DDIM",
+    "em": "DDPM EM",
+}
 
 
 def get_args():
@@ -51,16 +56,18 @@ def get_args():
     p.add_argument("--beta_max",  type=float, default=5.0)
     p.add_argument("--T",         type=int,   default=1000)
     p.add_argument("--n_samples", type=int,   default=1000)
+    p.add_argument("--batch_size",type=int,   default=128)
+    p.add_argument("--seed",      type=int,   default=0)
     p.add_argument("--device",    type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
-def save_samples_to_dir(samples: torch.Tensor, directory: str):
+def save_samples_to_dir(samples: torch.Tensor, directory: str, start_idx: int = 0):
     """Save (B,1,H,W) samples to individual PNG files for torch-fidelity."""
     os.makedirs(directory, exist_ok=True)
     samples = (samples.clamp(-1, 1) * 0.5 + 0.5)  # [0,1]
     for i, img in enumerate(samples):
-        save_image(img, os.path.join(directory, f"{i:05d}.png"))
+        save_image(img, os.path.join(directory, f"{start_idx + i:05d}.png"))
 
 
 def compute_kid(generated_dir: str, real_dir: str) -> dict:
@@ -69,19 +76,99 @@ def compute_kid(generated_dir: str, real_dir: str) -> dict:
         input2=real_dir,
         kid=True,
         kid_subset_size=min(1000, len(os.listdir(generated_dir))),
+        cuda=torch.cuda.is_available(),
         verbose=False,
     )
     return metrics
+
+
+def load_state_dict(model: torch.nn.Module, checkpoint: str, device) -> torch.nn.Module:
+    state = torch.load(checkpoint, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def save_real_fashionmnist(real_dir: str, n_samples: int):
+    tf = transforms.ToTensor()
+    ds = datasets.FashionMNIST("data", train=False, download=True, transform=tf)
+    os.makedirs(real_dir, exist_ok=True)
+    for i in range(n_samples):
+        img, _ = ds[i % len(ds)]
+        save_image(img, os.path.join(real_dir, f"{i:05d}.png"))
+
+
+@torch.no_grad()
+def generate_to_dir(
+    method: str,
+    steps: int,
+    out_dir: str,
+    n_samples: int,
+    batch_size: int,
+    device,
+    sde: VPSDE,
+    vp_model: UNet,
+    flow: RectifiedFlow,
+    rf_model: UNet,
+):
+    made = 0
+    while made < n_samples:
+        b = min(batch_size, n_samples - made)
+        shape = (b, 1, 28, 28)
+        if method == "rectflow":
+            samples = flow.euler_sample(rf_model, shape, num_steps=steps, device=device)
+        elif method == "ddim":
+            samples = sde.ddim_sample(vp_model, shape, num_steps=steps, device=device)
+        elif method == "em":
+            samples = sde.euler_maruyama(vp_model, shape, num_steps=steps, device=device)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        save_samples_to_dir(samples.cpu(), out_dir, start_idx=made)
+        made += b
 
 
 def main():
     args = get_args()
     device = torch.device(args.device)
 
-    # TODO (6.B) — load VP and RF models, loop over METHODS × STEP_COUNTS,
-    # generate n_samples for each, compute KID via torch-fidelity, and print
-    # a formatted table.
-    raise NotImplementedError
+    torch.manual_seed(args.seed)
+    sde = VPSDE(beta_min=args.beta_min, beta_max=args.beta_max, T=args.T)
+    vp_model = load_state_dict(UNet(in_channels=1, base_channels=64).to(device), args.vp_checkpoint, device)
+    flow = RectifiedFlow()
+    rf_model = load_state_dict(UNet(in_channels=1, base_channels=64).to(device), args.rf_checkpoint, device)
+
+    rows = []
+    with tempfile.TemporaryDirectory() as tmp:
+        real_dir = os.path.join(tmp, "real")
+        save_real_fashionmnist(real_dir, args.n_samples)
+        for method in METHODS:
+            for steps in STEP_COUNTS:
+                gen_dir = os.path.join(tmp, f"{method}_{steps}")
+                torch.manual_seed(args.seed)
+                generate_to_dir(
+                    method,
+                    steps,
+                    gen_dir,
+                    args.n_samples,
+                    args.batch_size,
+                    device,
+                    sde,
+                    vp_model,
+                    flow,
+                    rf_model,
+                )
+                metrics = compute_kid(gen_dir, real_dir)
+                mean = metrics["kernel_inception_distance_mean"]
+                std = metrics["kernel_inception_distance_std"]
+                rows.append((METHOD_LABELS[method], steps, mean, std))
+                print(f"{METHOD_LABELS[method]:14s} {steps:4d}: {mean:.6f} ± {std:.6f}")
+
+    print("\n| Method | Steps | KID mean | KID std |")
+    print("|---|---:|---:|---:|")
+    for method, steps, mean, std in rows:
+        print(f"| {method} | {steps} | {mean:.6f} | {std:.6f} |")
 
 
 if __name__ == "__main__":

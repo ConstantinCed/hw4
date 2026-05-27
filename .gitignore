@@ -1,1 +1,17 @@
 .DS_Store
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+uv.lock
+.ipynb_checkpoints/
+runs/
+data/*
+!data/README.md
+
+figures/notebook_outputs/

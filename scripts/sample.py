@@ -64,7 +64,7 @@ def save_grid(samples: torch.Tensor, path: str, nrow: int = 8, title: str = ""):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--method",      type=str, default="em",
-                   choices=["em", "pc", "rectflow", "all"],
+                   choices=["em", "pc", "ddim", "rectflow", "all"],
                    help="Sampler to run (or 'all' for side-by-side grid).")
     # VP checkpoints
     p.add_argument("--checkpoint",    type=str, default=None)
@@ -88,12 +88,35 @@ def get_args():
     return p.parse_args()
 
 
-def load_vp_model(checkpoint: str, device) -> tuple[VPSDE, UNet]:
-    raise NotImplementedError("Fill in VPSDE and UNet loading.")
+def _load_state_dict(model: torch.nn.Module, checkpoint: str, device) -> torch.nn.Module:
+    state = torch.load(checkpoint, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def load_vp_model(
+    checkpoint: str,
+    device,
+    beta_min: float = 0.01,
+    beta_max: float = 5.0,
+    T: int = 1000,
+) -> tuple[VPSDE, UNet]:
+    if checkpoint is None:
+        raise ValueError("A VP checkpoint is required.")
+    sde = VPSDE(beta_min=beta_min, beta_max=beta_max, T=T)
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    return sde, _load_state_dict(model, checkpoint, device)
 
 
 def load_rf_model(checkpoint: str, device) -> tuple[RectifiedFlow, UNet]:
-    raise NotImplementedError("Fill in RectifiedFlow and UNet loading.")
+    if checkpoint is None:
+        raise ValueError("A rectified-flow checkpoint is required.")
+    flow = RectifiedFlow()
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    return flow, _load_state_dict(model, checkpoint, device)
 
 
 def main():
@@ -104,21 +127,73 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.method == "em":
-        # TODO (5.C.iii)
-        raise NotImplementedError
+        sde, model = load_vp_model(
+            args.checkpoint,
+            device,
+            beta_min=args.beta_min,
+            beta_max=args.beta_max,
+            T=args.T,
+        )
+        samples = sde.euler_maruyama(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples.cpu(), args.out, nrow=8, title=f"DDPM EM ({args.num_steps} steps)")
 
     elif args.method == "pc":
-        # TODO (5.C.iv)
-        raise NotImplementedError
+        sde, model = load_vp_model(
+            args.checkpoint,
+            device,
+            beta_min=args.beta_min,
+            beta_max=args.beta_max,
+            T=args.T,
+        )
+        samples = sde.predictor_corrector(
+            model,
+            shape,
+            num_steps=args.num_steps,
+            n_corrector=args.n_corrector,
+            snr=args.snr,
+            device=device,
+        )
+        save_grid(samples.cpu(), args.out, nrow=8, title=f"PC ({args.num_steps} steps)")
+
+    elif args.method == "ddim":
+        sde, model = load_vp_model(
+            args.checkpoint,
+            device,
+            beta_min=args.beta_min,
+            beta_max=args.beta_max,
+            T=args.T,
+        )
+        samples = sde.ddim_sample(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples.cpu(), args.out, nrow=8, title=f"DDIM ({args.num_steps} steps)")
 
     elif args.method == "rectflow":
-        # TODO (6.B / 6.C)
-        raise NotImplementedError
+        checkpoint = args.checkpoint or args.rf_checkpoint
+        flow, model = load_rf_model(checkpoint, device)
+        samples = flow.euler_sample(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples.cpu(), args.out, nrow=8, title=f"Rectified Flow ({args.num_steps} steps)")
 
     elif args.method == "all":
-        # TODO (6.D) — generate 8 fixed-seed samples from each method and
-        # arrange them in a 4×8 grid as specified in Problem 6.D.
-        raise NotImplementedError
+        sde, vp_model = load_vp_model(
+            args.vp_checkpoint,
+            device,
+            beta_min=args.beta_min,
+            beta_max=args.beta_max,
+            T=args.T,
+        )
+        flow, rf_model = load_rf_model(args.rf_checkpoint, device)
+        reflow, reflow_model = load_rf_model(args.reflow_checkpoint, device)
+
+        row_shape = (8, 1, 28, 28)
+        torch.manual_seed(args.seed)
+        em = sde.euler_maruyama(vp_model, row_shape, num_steps=1000, device=device)
+        torch.manual_seed(args.seed)
+        rf100 = flow.euler_sample(rf_model, row_shape, num_steps=100, device=device)
+        torch.manual_seed(args.seed)
+        rf1 = flow.euler_sample(rf_model, row_shape, num_steps=1, device=device)
+        torch.manual_seed(args.seed)
+        reflow1 = reflow.euler_sample(reflow_model, row_shape, num_steps=1, device=device)
+        samples = torch.cat([em, rf100, rf1, reflow1], dim=0)
+        save_grid(samples.cpu(), args.out, nrow=8, title="")
 
 
 if __name__ == "__main__":
